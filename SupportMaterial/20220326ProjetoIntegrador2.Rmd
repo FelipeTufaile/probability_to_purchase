@@ -1,0 +1,1231 @@
+---
+title: "Projeto Integrador"
+author: "Felipe Tufaile, Vinicius de Camargo, Caio Cabral, Djalma Saraiva"
+date: "26/03/2022"
+output:
+  html_document:
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+### Firm Exiting
+The present study aims to build a prediction model for business default. For this purpose, it will be used a database collected and curated by **Bisnode**, an European company in the business information field.\
+The database has financial (balance sheet) and operational data of 46.412 companies across Europe, in a variety of segments of the economy, between 2005 and 2016 (the dataset and more information can be accessed directly on the **OSF** website, an open platform to support research and enable collaboration, see bibliographic reference at the end of this document).\
+The analysis will be divide in two stages: 1 - Data processing and feature engineering, 2 - Model building. The first stage will be conducted entirely using python programming language in microsoft visual code whereas the second stage will be conducted using R programming language in R Studio.\
+Furthermore, the study will consider the following premises and boudary conditions:\
+
+- The predictive modeling will be carried out considering the year 2012;
+- The company that has defaulted will be the one that does not have sales in 2014;
+- The target variable will be the column named **default**: a column created to indicate which companies had no sales in 2014;
+- It will be considered companies will total sales, in 2012, between 1 thousand and 1 million euros;
+
+
+### Setting Global Variables
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, include = TRUE, message = FALSE)
+```
+
+### Installing Libraries
+```{r}
+# INSTALLING LIBRARIES
+# install.packages("vip")
+# install.packages('skimr')
+# install.packages('GGally')
+# install.packages("pdp")
+# install.packages("vip")
+# install.packages("vip")
+# install.packages("glmnet")
+# install.packages('caret')
+# install.packages("rpart")
+# install.packages("ggpubr")
+# install.packages("ranger")
+# install.packages("janitor")
+# install.packages("xgboost")
+# install.packages("forcats")
+# install.packages("gbm")
+```
+
+### Loading Libraries
+```{r message = FALSE}
+# IMPORTING LIBRARIES
+library(tidyverse)
+library(skimr)
+library(GGally)
+library(ggplot2)
+library(caret)
+library(vip)
+library(pdp)
+library(glmnet)
+library(rpart)
+library(rpart.plot)
+library(ggpubr)
+library(ranger)
+library(reshape2)
+library(dplyr)
+library(janitor)
+library(pROC)
+library(DALEX)
+library(xgboost)
+library(rsample)
+library(forcats)
+library(gbm)
+```
+
+### Data Loading
+
+Loading the processed dataset. The processed dataset has 171 columns (features) in total. Among these columns, the **default** column will be used as explained variable and the **comp_id** column will be removed from modeling since it is only used as an campany identification column and shouldn't provide any information regarding company defaulting. In summary, the adjusted dataset has 21.717 companies (observations), among which 949 will default in 2014 (4,4% of positive observations) and 20.768 are operational in 2014 (95,6% of negative observations). **Therefore, it is evident that the dataset is unbalanced, with many more negative than positive observations.**\
+The command **skim(bisnode)** will be commented so it will not print the extensive list of columns used in modeling. It can be uncommented if there is a need to understand some feature.
+
+```{r, message = FALSE}
+# Reading dataset "bisnode_ajustado_completo_2012.csv"
+bisnode <- read_csv("bisnode_ajustado_completo_2012.csv")
+
+# Adjusting feature's name
+bisnode <- clean_names(bisnode)
+
+# Printing a resumed evaluation of the dataset
+# skim(bisnode)
+
+# Remove column "comp_id"
+bisnode <- bisnode %>% select(-comp_id)
+```
+
+
+### Separating the Dataset: 80% Train e 20% Test
+
+The following models will be evaluated for the purpose of the study:
+
+- Logistic Regression
+- Lasso Regularization
+- Random Forest
+- GBM - Adaboost
+- XGBoost - Binary Logistic
+
+In order to do so, we will first divide the dataset into two sets:training (80% of the observations) and testing (20% of the observations).\
+For all dataset splitting throughout this work it will be fixed **seed(0)** so all the same training and test set are used for all models.\
+After splitting, the training set has 17.373 samples observations and the testing set has 4.344 observations.
+
+
+```{r}
+# Setting a seed to fix a random sequence | for reproducibility purposes
+set.seed(0) 
+
+# Splitting the dataset into training and testing
+splits <- initial_split(bisnode, prop = 0.8, strata=default)
+# Training data
+dt_tr <- training(splits)
+# Test data
+dt_tt <- testing(splits)
+```
+
+
+### Creating a "Result" Dataframe
+
+A **Result** table will be created in order to hold some key performance metrics calculated for each model in order to facilitate comparisons between the performance of each model.
+
+
+```{r}
+results <- tibble(model = c("LR", "LR Lasso", "RF", "GBM", "XGB"),
+                  lambda_value = c(0, 0, 0, 0, 0),
+                  accuracy = c(0, 0, 0, 0, 0),
+                  precision = c(0, 0, 0, 0, 0),
+                  recall = c(0, 0, 0, 0, 0),
+                  f1_score = c(0, 0, 0, 0, 0),
+                  auc = c(0, 0, 0, 0, 0))
+```
+
+### Function Definition
+
+The following function creates a series of evaluation metrics that will be used to measure the performance of each model.
+The metrics calculated are:
+
+- Number of **True Positive**;
+- Number of **False Positive**;
+- Number of **True Negative**;
+- Number of **False Negative**;
+- **Accuracy**;
+- **Precision**;
+- **Recall**;
+- **F1 Score**;
+- **True Positive Rate** / **Sensitivity**;
+- **True Negative Rate** / **Specificity**;
+- **False Positive Rate**;
+- **False Negative Rate**;
+- **Custom Metric**;
+
+The custom metric in the final bullet account for a business metric that attempts to capture business interests. It is an additional metric among the traditional metrics. For the context of this study it will be considered that the predictions made will be used in order to decide whether or not to lend money to a company: if the model predicts a company will be operational in 2014 the model would suggest to lend money to that company, otherwise, the model would suggest to not lend money to the company. It will also me assumed that lending money to a company that doesn't default results 30% of profit, whereas lending money to a company that defaults results a loss of 100% of the lent money. Also, it will be considered that not lending money to a company that does not defaults results a cost of opportunity of 30%, in other words, it means that the business could have profited 30% of the lent money. Taken the premises stated into consideration, the custom metric will be defined according as follows:
+
+- A **True Positive** prediction results 00,0% of profit;
+- A **True Negative** prediction results 30,0% of profit;
+- A **False Positive** prediction results -30,0% of loss;
+- A **False Negative** prediction results -100,0% of loss;
+
+\
+Custom Metric = $\frac{0.3[True Negative] -0.3[False Positive] -1[False Negative]}{[False Negative] + [False Positive] + [True Negative] + [True Positive]}$
+
+The business objective will be to find the model and threshold that maximizes the value of the custom metric.
+
+Although it is also being calculated a custom metric to account for business strategies, **the study will be conducted with the main objective of finding the model a model that maximizes the F1 Score**, which is more appropriate for an unbalanced dataset. In the last section the study will make a consideration about the customized metric.
+
+```{r}
+# Creating a function for evaluating precision for different thresholds
+metrics_table <- function(threshold, val_vector, pred_vector) {
+  
+  # Classification
+  pred_class <- ifelse(pred_vector >= threshold, 1, 0)
+  
+  # Calculate True Positive
+  true_positive <- sum(ifelse(val_vector + pred_class == 2, 1, 0))
+  
+  # Calculate True Negative
+  true_negative <- sum(ifelse(val_vector + pred_class == 0, 1, 0))
+  
+  # Calculate False Positive
+  false_positive <- sum(ifelse(val_vector + pred_class == 1 & pred_class == 1, 1, 0))
+  
+  # Calculate False Negative
+  false_negative <- sum(ifelse(val_vector + pred_class == 1 & pred_class == 0, 1, 0))
+  
+  # Calculate Accuracy
+  accuracy <- (true_positive + true_negative) / (true_positive + true_negative + false_positive + false_negative)
+  
+  # Calculate Precision
+  precision <- true_positive / (true_positive + false_positive)
+  
+  # Calculate recall
+  recall <- true_positive / (true_positive + false_negative)
+  
+  # Calculate F1 Score
+  f1_score <- 2*precision*recall / (precision + recall)
+  
+  # Calculate True Positive Rate (TPR) | Sensitivity  -> TP / Actual Positive
+  tpr <- true_positive / (true_positive + false_negative)
+  
+  # Calculate True Negative Rate (TNR) | Specificity  -> TN / Actual Negative
+  tnr <- true_negative / (false_positive + true_negative)
+  
+  # Calculate False Negative Rate (FNR) -> FN / Actual Positive
+  fnr <- false_negative / (true_positive + false_negative)
+  
+  # Calculate False Positive Rate (FPR) -> FP / Actual Negative
+  fpr <- false_positive / (true_negative + false_positive)
+  
+  # Customized metric in order to account for business strategy
+  custom_metric <- ((0.3)*true_negative + (-1)*false_negative + (0)*true_positive + (-0.3)*false_positive)
+  custom_metric <- custom_metric / (true_positive + true_negative + false_positive + false_negative)
+  
+  metrics <- tibble(metric = c("True Positive (TP)", 
+                               "True Negative (TN)", 
+                               "False Positive (FP)", 
+                               "False Negative (FN)",
+                               "Accuracy",
+                               "Precision",
+                               "Recall",
+                               "F1 Score",
+                               "True Positive Rate (TPR)",
+                               "True Negative Rate (TNR)",
+                               "False Negative Rate (FNR)",
+                               "False Positive Rate (FPR)",
+                               "Sensitivity",
+                               "Specificity",
+                               "Custom Metric"),
+                    values = c(0,0,0,0,0,0,0,0,0,0,0,0,0,0,0))
+  
+  metrics$values[metrics$metric == "True Positive (TP)"] <- true_positive
+  metrics$values[metrics$metric == "True Negative (TN)"] <- true_negative
+  metrics$values[metrics$metric == "False Positive (FP)"] <- false_positive
+  metrics$values[metrics$metric == "False Negative (FN)"] <- false_negative
+  metrics$values[metrics$metric == "Accuracy"] <- accuracy
+  metrics$values[metrics$metric == "Precision"] <- precision
+  metrics$values[metrics$metric == "Recall"] <- recall
+  metrics$values[metrics$metric == "F1 Score"] <- f1_score
+  metrics$values[metrics$metric == "True Positive Rate (TPR)"] <- tpr
+  metrics$values[metrics$metric == "True Negative Rate (TNR)"] <- tnr
+  metrics$values[metrics$metric == "False Negative Rate (FNR)"] <- fnr
+  metrics$values[metrics$metric == "False Positive Rate (FPR)"] <- fpr
+  metrics$values[metrics$metric == "Sensitivity"] <- tpr
+  metrics$values[metrics$metric == "Specificity"] <- tnr
+  metrics$values[metrics$metric == "Custom Metric"] <- custom_metric
+  
+  # Calculate 
+  return (metrics)
+}
+```
+
+
+###  Logistic Regression
+
+The logistic regression model will be performed using the **glm** function with a **binomial** family. The explained variable will be the binary variable **default**, as explained in previous sections.
+
+
+```{r logistic_fitting, cache=TRUE}
+# Creating a logistic regression model considering all features from the training dataset (dt_tr) but the default feature (target feature)
+model_lg <- glm(default ~ ., dt_tr, family = "binomial")
+
+# Prediction of satisfied clients for the training set
+yhat_lg_tr <- predict(model_lg, dt_tr, type="response")
+
+# Prediction of satisfied clients for the test set
+yhat_lg_tt <- predict(model_lg, dt_tt, type="response")
+
+# Table of metrics for plotting
+table_lg <- tibble(threshold = c(seq(0, 1, 0.01)),
+                   true_positive_rate = NA,
+                   false_positive_rate = NA,
+                   accuracy = NA,
+                   precision = NA,
+                   recall = NA,
+                   f1_score = NA)
+
+# Calculate metrics for varying thresholds
+for ( t in c(seq(0.0, 1, 0.01)) ){
+  
+  tb <- metrics_table(t, dt_tt$default,yhat_lg_tt)
+  
+  table_lg$true_positive_rate[table_lg$threshold == t]   <- tb$values[tb$metric == "True Positive Rate (TPR)"]
+  table_lg$false_positive_rate[table_lg$threshold == t]  <- tb$values[tb$metric == "False Positive Rate (FPR)"]
+  table_lg$accuracy[table_lg$threshold == t]             <- tb$values[tb$metric == "Accuracy"]
+  table_lg$precision[table_lg$threshold == t]            <- tb$values[tb$metric == "Precision"]
+  table_lg$recall[table_lg$threshold == t]               <- tb$values[tb$metric == "Recall"]
+  table_lg$f1_score[table_lg$threshold == t]             <- tb$values[tb$metric == "F1 Score"]
+  
+}
+
+table_lg <- table_lg[complete.cases(table_lg), ]
+
+
+# Calculating Optimal Threshold
+opt_threshold <- table_lg$threshold[table_lg$f1_score == max(table_lg$f1_score, na.rm = TRUE)]
+opt_tpr <- table_lg$true_positive_rate[table_lg$f1_score == max(table_lg$f1_score, na.rm = TRUE)]
+
+# Table filtering considering the optimal threshold as the value that maximizes the metric F1-Score
+table_lg %>% filter(table_lg$threshold == opt_threshold)
+```
+
+In following charts, the first image illustrates the accuracy and F1-score curves for varying threshold, while the second image illustrates the ROC curve. It is possible to note that the accuracy metric doesn't have an important role in this problem since it remains the same, next to 94%, for most threshold values. That makes sense since the dataset is highly unbalanced and most observations are negative.\
+The F1 score plot, however, indicates another behaviour: first, there is a optimal value of threshold that maximizes the F1 score and, second, the maximum value of the F1 score is much lower than the maximum value of the accuracy. Considering the objective of maximizing the F1 score, **the best threshold for the logistic regression model is 0.16**.\
+The ROC curve in the second image indicates that the overall performance of the model is much better than a simple guess approach (blue line) for deciding which company is going to default. The red dot also indicates which combination of **True Positive Rate** and **False Positive Rate** corresponds to optimal threshold.
+
+
+```{r}
+# Creating selections
+table_lg %>% 
+  select(threshold, accuracy) %>% 
+  dplyr::rename(value = accuracy) %>% 
+  mutate(metric = "Accuracy") %>% 
+# Binding rows
+bind_rows(
+    table_lg %>% 
+    select(threshold, f1_score) %>% 
+      dplyr::rename(value = f1_score) %>% 
+      mutate(metric = "F1 Score")) %>% 
+        # Plotting
+        ggplot(aes(x=threshold, y=value, group = metric, color = metric)) + 
+        geom_line() +
+        ggtitle("Accuracy and F1-Score for varying thresholds  | Logistic Regression Without Regularization") +
+        xlab("Threshold") +
+        ylab("Metric Value")
+```
+
+
+```{r}
+# Plotting ROC Curve
+table_lg %>%
+  ggplot(aes(x=false_positive_rate, y=true_positive_rate, color = true_positive_rate == opt_tpr)) + 
+  geom_point() +
+  scale_color_manual(values = c("FALSE" = "darkgray", "TRUE" = "red")) +
+  geom_abline(intercept = 0, slope = 1, color="blue", linetype="dashed", size=1.0) +
+  ggtitle("Receiver Operating Characteristic (ROC) Curve | Logistic Regression Without Regularization") +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  xlab("False Positive Rate (1 - Specificity)") +
+  ylab("True Positive Rate (Sensitivity)") + 
+  theme_light()
+```
+
+The result table bellow shows the summary performance of the logistic regression model. The **F1 Score** value and the **AUC** value are, **0.371** and **0.863**, respectively. In the sequence, the confusion matrix for the logistic regression model is shown in order to indicate the number of observations the model have predicted in the wrong class.
+
+```{r}
+# Updating results table
+results$accuracy[results$model == "LR"]  <- table_lg$accuracy[table_lg$f1_score == max(table_lg$f1_score)]
+results$precision[results$model == "LR"] <- table_lg$precision[table_lg$f1_score == max(table_lg$f1_score)]
+results$recall[results$model == "LR"]    <- table_lg$recall[table_lg$f1_score == max(table_lg$f1_score)]
+results$f1_score[results$model == "LR"]  <- table_lg$f1_score[table_lg$f1_score == max(table_lg$f1_score)]
+results$auc[results$model == "LR"]       <- roc(dt_tt$default, yhat_lg_tt)$auc
+results
+```
+
+
+```{r}
+# Plotting Confusion Matrix
+cmt_lg <- metrics_table(opt_threshold, dt_tt$default, yhat_lg_tt)
+confusion_matrix_lg <- tibble(x = c("Actual Positive", "Actual Negative"),
+                           y = c(cmt_lg$values[cmt_lg$metric == "True Positive (TP)"], 
+                                 cmt_lg$values[cmt_lg$metric == "False Positive (FP)"]),
+                           z = c(cmt_lg$values[cmt_lg$metric == "False Negative (FN)"],
+                                 cmt_lg$values[cmt_lg$metric == "True Negative (TN)"]))
+knitr::kable(confusion_matrix_lg,
+             caption = "Confusion Matrix | Logistic Regression Without Regularization",
+             col.names = c("Measure", "Predicted Positive", "Predicted Negative"))
+```
+
+
+###  Logistic Regression With Lasso Regularization
+
+The logistic regression model With Lasso Regularization will be performed using the **glm** function with a **binomial** family and setting **alpha** to 1. The regularization parameter, **$\lambda$**, will be obtained through cross-validation using function **cv.glmnet**. he resulting **$\lambda$** value is, approximately,  **0.00435**. It can be seen, in the following plot, the the chosen value for **$\lambda$** results a reduction in the number of features from 169 to 24, a significant reduction. That indicates that many features in the dataset (nearly 86% of the features) doesn't really seems to have an important role in explaning the default behaviour.
+
+
+```{r lasso_fitting, cache=TRUE}
+# Preparing the model for gmlet
+# Selecting train
+X_tr <- model.matrix(default~., dt_tr)
+y_tr <- dt_tr$default
+
+# Selecting test
+X_tt <- model.matrix(default~., dt_tt)
+y_tt <- dt_tt$default
+
+# LASSO -> Logistic Regression (family=binomial, alpha=1)
+
+# Build a model with regularization with varying 500 lambdas
+lg_lasso <- glmnet(X_tr, y_tr, family="binomial", alpha = 1, nlambda = 500)
+
+# Preforming Cross Validation (CV) in order to determine the best lambda
+cv_lasso <- cv.glmnet(X_tr, y_tr, family="binomial", alpha=1)
+
+# Optimal lambda
+opt_lambda_lasso <- cv_lasso$lambda.1se
+
+# Plotting the model for varying lambda
+plot(cv_lasso)
+```
+
+
+```{r}
+# Calculating the predictions using the regularized model after cross-validation | Training
+yhat_lg_lasso_tr <- predict(cv_lasso, newx = X_tr, s = opt_lambda_lasso, type="response")
+
+# Calculating the predictions using the regularized model after cross-validation | Test
+yhat_lg_lasso_tt <- predict(cv_lasso, newx = X_tt, s = opt_lambda_lasso, type="response")
+
+# Table of metrics for plotting
+tb_lasso <- tibble(threshold = c(seq(0, 1, 0.01)),
+                   true_positive_rate = NA,
+                   false_positive_rate = NA,
+                   accuracy = NA,
+                   precision = NA,
+                   recall = NA,
+                   f1_score = NA)
+
+# Calculate metrics for varying thresholds
+for ( t in c(seq(0, 1, 0.01)) ){
+  
+  tb <- metrics_table(t, dt_tt$default, yhat_lg_lasso_tt)
+  
+  tb_lasso$true_positive_rate[tb_lasso$threshold == t]   <- tb$values[tb$metric == "True Positive Rate (TPR)"]
+  tb_lasso$false_positive_rate[tb_lasso$threshold == t]  <- tb$values[tb$metric == "False Positive Rate (FPR)"]
+  tb_lasso$accuracy[tb_lasso$threshold == t]             <- tb$values[tb$metric == "Accuracy"]
+  tb_lasso$precision[tb_lasso$threshold == t]            <- tb$values[tb$metric == "Precision"]
+  tb_lasso$recall[tb_lasso$threshold == t]               <- tb$values[tb$metric == "Recall"]
+  tb_lasso$f1_score[tb_lasso$threshold == t]             <- tb$values[tb$metric == "F1 Score"]
+  
+}
+
+tb_lasso <- tb_lasso[complete.cases(tb_lasso), ]
+
+# Calculating Optimal Threshold
+opt_threshold_lasso <- tb_lasso$threshold[tb_lasso$f1_score == max(tb_lasso$f1_score, na.rm = TRUE)]
+opt_tpr_lasso <- tb_lasso$true_positive_rate[tb_lasso$f1_score == max(tb_lasso$f1_score, na.rm = TRUE)]
+
+# Best Result
+tb_lasso %>% filter(tb_lasso$f1_score == max(tb_lasso$f1_score, na.rm = TRUE))
+```
+
+The accuracy and F1-score curves and the ROC curve for the Logistic Regression with Lasso regularization look very similar to the ones obtained to the Logistic Regression without regularization, with no significant changes that is worth mentioning. **The best threshold for the logistic regression model with LASSO is also very close, 0.17**.
+
+
+```{r}
+# Creating selections
+tb_lasso %>% 
+  select(threshold, accuracy) %>% 
+  dplyr::rename(value = accuracy) %>% 
+  mutate(metric = "Accuracy") %>% 
+# Binding rows
+bind_rows(
+    tb_lasso %>% 
+    select(threshold, f1_score) %>% 
+      dplyr::rename(value = f1_score) %>% 
+      mutate(metric = "F1 Score")) %>% 
+        # Plotting
+        ggplot(aes(x=threshold, y=value, group = metric, color = metric)) + 
+        geom_line() +
+        ggtitle("Accuracy and F1-Score for varying thresholds | Logistic Regression With Lasso Regularization") +
+        xlab("Threshold") +
+        ylab("Metric Value")
+```
+
+
+```{r}
+# Plotting ROC Curve
+tb_lasso %>%
+  ggplot(aes(x=false_positive_rate, y=true_positive_rate, color = true_positive_rate == opt_tpr_lasso)) + 
+  geom_point() +
+  scale_color_manual(values = c("FALSE" = "grey", "TRUE" = "red")) +
+  geom_abline(intercept = 0, slope = 1, color="blue", linetype="dashed", size=1.0) +
+  ggtitle("Receiver Operating Characteristic (ROC) Curve | Logistic Regression With Lasso Regularization") +
+  xlab("False Positive Rate") +
+  ylab("True Positive Rate") + 
+  theme_light()
+```
+
+The following result table shows the summary performance of the logistic regression model with LASSO regularization. The **F1 Score** value is **0.344**, slightly lower than the previous model, and the **AUC** value is **0.858**, also slightly lower than the previous model. Therefore, it can be shown that despite the huge reduction in the number of features, the were no much reduction performance, which indicates that, in fact, there is a lot of features doesn't really explain anything about companies defaulting. In the sequence, the confusion matrix for the logistic regression model with LASSO is shown in order to indicate the number of observations the model have predicted in the wrong class.
+
+```{r}
+# Updating results table
+results$accuracy[results$model == "LR Lasso"]     <- tb_lasso$accuracy[tb_lasso$f1_score == max(tb_lasso$f1_score)]
+results$precision[results$model == "LR Lasso"]    <- tb_lasso$precision[tb_lasso$f1_score == max(tb_lasso$f1_score)]
+results$recall[results$model == "LR Lasso"]       <- tb_lasso$recall[tb_lasso$f1_score == max(tb_lasso$f1_score)]
+results$f1_score[results$model == "LR Lasso"]     <- tb_lasso$f1_score[tb_lasso$f1_score == max(tb_lasso$f1_score)]
+results$auc[results$model == "LR Lasso"]          <- roc(y_tt, c(yhat_lg_lasso_tt))$auc
+results$lambda_value[results$model == "LR Lasso"] <- opt_lambda_lasso
+results
+```
+
+
+```{r}
+# Plotting Confusion Matrix
+cmt_lg_lasso <- metrics_table(opt_threshold_lasso, dt_tt$default, yhat_lg_lasso_tt)
+confusion_matrix_lasso <- tibble(x = c("Actual Positive", "Actual Negative"),
+                                 y = c(cmt_lg_lasso$values[cmt_lg_lasso$metric == "True Positive (TP)"], 
+                                       cmt_lg_lasso$values[cmt_lg_lasso$metric == "False Positive (FP)"]),
+                                 z = c(cmt_lg_lasso$values[cmt_lg_lasso$metric == "False Negative (FN)"],
+                                       cmt_lg_lasso$values[cmt_lg_lasso$metric == "True Negative (TN)"]))
+knitr::kable(confusion_matrix_lasso,
+             caption = "Confusion Matrix | Logistic Regression with Lasso Regularization",
+             col.names = c("Measure", "Predicted Positive", "Predicted Negative"))
+```
+
+
+### Random Forest Model
+
+The following segment show a first attempt to fit a random forest model in the dataset. In order to do so, it was used the function **ranger** to build models for a range of **mtry** and **num.trees** values in order to determine the optimal value for these two hyperparameters. The following chunck of code performs a grid search for the best values for the hyperparameters mentioned.
+
+```{r ranfom_forest_tuning, cache=TRUE}
+# Creating a function for tuning the hyperparameters of the random forest model
+rf_tuning <- function(mtry, n_arvores) {
+  fit <- ranger(default ~ .,num.trees = n_arvores, mtry = mtry, data = dt_tr)
+  return(sqrt(fit$prediction.error))}
+
+# Simulating random forest models for testing hyperparameters
+rf_results <- crossing(mtry = c(seq(5, 25, 5)), n_trees = c(1:10, 50, 100, 250, 500)) %>% 
+              mutate(rmse = map2_dbl(mtry, n_trees, rf_tuning))
+
+# Plotting results
+rf_results %>% 
+  ggplot(aes(x=n_trees, y=rmse, group = mtry, color = factor(mtry))) +
+  geom_line() +
+  ggtitle("Model error - out-of-bag error") +
+  ylab("Root Mean Squared Error") +
+  xlab("Number of Trees")
+```
+
+It can be shown in the image above that there is not much significant reduction in loss for all the **mtry** values tested. Also, it can be seen that 500 trees seems to be enough in order for the error to stabilize. For that reason, the best model will be cinfigured with **mtry = 10** and **num.trees = 500**.
+
+```{r random_forest_best_model, cache=TRUE}
+# Using the best hyperparameters in order to create the final model
+rf_model <- ranger(default ~., mtry = 10, num.trees = 500, importance = "permutation", data = dt_tr)
+
+# Creating predictions using the optimal random forest
+yhat_tr_rf <- predict(rf_model, dt_tr)
+
+# Creating predictions using the optimal random forest
+yhat_tt_rf <- predict(rf_model, dt_tt)
+
+# Table of metrics for plotting
+tb_rf <- tibble(threshold = c(seq(0, 1, 0.01)),
+                true_positive_rate = NA,
+                false_positive_rate = NA,
+                accuracy = NA,
+                precision = NA,
+                recall = NA,
+                f1_score = NA)
+
+# Calculate metrics for varying thresholds
+for ( t in c(seq(0, 1, 0.01)) ){
+  
+  tb <- metrics_table(t, dt_tt$default, yhat_tt_rf$predictions)
+  
+  tb_rf$true_positive_rate[tb_rf$threshold == t]   <- tb$values[tb$metric == "True Positive Rate (TPR)"]
+  tb_rf$false_positive_rate[tb_rf$threshold == t]  <- tb$values[tb$metric == "False Positive Rate (FPR)"]
+  tb_rf$accuracy[tb_rf$threshold == t]             <- tb$values[tb$metric == "Accuracy"]
+  tb_rf$precision[tb_rf$threshold == t]            <- tb$values[tb$metric == "Precision"]
+  tb_rf$recall[tb_rf$threshold == t]               <- tb$values[tb$metric == "Recall"]
+  tb_rf$f1_score[tb_rf$threshold == t]             <- tb$values[tb$metric == "F1 Score"]
+  tb_rf$f1_score[tb_rf$threshold == t]             <- tb$values[tb$metric == "F1 Score"]
+  
+}
+
+tb_rf <- tb_rf[complete.cases(tb_rf), ]
+
+# Calculating Optimal Threshold
+opt_threshold_rf <- tb_rf$threshold[tb_rf$f1_score == max(tb_rf$f1_score, na.rm = TRUE)][1]
+opt_tpr_rf <- tb_rf$true_positive_rate[tb_rf$f1_score == max(tb_rf$f1_score, na.rm = TRUE)][1]
+
+# Best Result
+tb_rf %>% filter(tb_rf$threshold == opt_threshold_rf)
+```
+
+Again, The accuracy and F1-score curves and the ROC curve for random forest model look very similar to the previous ones, with no significant changes that is worth mentioning. **The best threshold for the random forest model is also very close, 0.15**.
+
+
+```{r}
+# Creating selections
+tb_rf %>% 
+  select(threshold, accuracy) %>% 
+  dplyr::rename(value = accuracy) %>% 
+  mutate(metric = "Accuracy") %>% 
+# Binding rows
+bind_rows(
+    tb_rf %>% 
+    select(threshold, f1_score) %>% 
+      dplyr::rename(value = f1_score) %>% 
+      mutate(metric = "F1 Score")) %>% 
+        # Plotting
+        ggplot(aes(x=threshold, y=value, group = metric, color = metric)) + 
+        geom_line() +
+        ggtitle("Accuracy and F1-Score for varying thresholds | Random Forest") +
+        xlab("Threshold") +
+        ylab("Metric Value")
+```
+
+
+```{r}
+# Plotting ROC Curve
+tb_rf %>%
+  ggplot(aes(x=false_positive_rate, y=true_positive_rate, color = true_positive_rate == opt_tpr_rf)) + 
+  geom_point() +
+  scale_color_manual(values = c("FALSE" = "grey", "TRUE" = "red")) +
+  geom_abline(intercept = 0, slope = 1, color="blue", linetype="dashed", size=1.0) +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  ggtitle("Receiver Operating Characteristic (ROC) Curve | Random Forest") +
+  xlab("False Positive Rate") +
+  ylab("True Positive Rate") +
+  theme_light()
+```
+
+The summary performance of the random forest model. Indicates a slightly decrease for the **F1 Score** value, **0.337**, with slightly increase in the **AUC** value, **0.885**. It is important to notice, however, a significant increase in the recall value, suggesting a better performance at predicting positive classes. In the business context of the problem studied it could be an interesting behaviour. In the sequence, the confusion matrix for the logistic regression model with LASSO is shown in order to indicate the number of observations the model have predicted in the wrong class.
+
+
+```{r}
+# Updating results table
+results$accuracy[results$model == "RF"]  <- tb_rf$accuracy[tb_rf$threshold == opt_threshold_rf]
+results$precision[results$model == "RF"] <- tb_rf$precision[tb_rf$threshold == opt_threshold_rf]
+results$recall[results$model == "RF"]    <- tb_rf$recall[tb_rf$threshold == opt_threshold_rf]
+results$f1_score[results$model == "RF"]  <- tb_rf$f1_score[tb_rf$threshold == opt_threshold_rf]
+results$auc[results$model == "RF"]       <- roc(dt_tt$default, c(yhat_tt_rf$predictions))$auc
+results
+```
+
+
+```{r}
+# Plotting Confusion Matrix
+cmt_lg_rf <- metrics_table(opt_threshold_rf, dt_tt$default, yhat_tt_rf$predictions)
+confusion_matrix_rf <- tibble(x = c("Actual Positive", "Actual Negative"),
+                                 y = c(cmt_lg_rf$values[cmt_lg_rf$metric == "True Positive (TP)"], 
+                                       cmt_lg_rf$values[cmt_lg_rf$metric == "False Positive (FP)"]),
+                                 z = c(cmt_lg_rf$values[cmt_lg_rf$metric == "False Negative (FN)"],
+                                       cmt_lg_rf$values[cmt_lg_rf$metric == "True Negative (TN)"]))
+knitr::kable(confusion_matrix_rf,
+             caption = "Confusion Matrix | Random Forest",
+             col.names = c("Measure", "Predicted Positive", "Predicted Negative"))
+```
+
+
+### GBM - Adaboost
+
+In the next section it will be studied the first boosting model with the aid of the **GBM** library. Since the analysis deals with a classification problem, the algorithm used with the **GBM** function will be the **Adaboost** algorithm. Therefore, the **distribution** parameter of the function will be set to **adaboost**. For the purpose of tuning the GBM - Adaboost model, it will be created a grid search varying the following parameters:
+
+- **shrinkage**: the learning rate of the gradient descent algorithm;
+- **n.trees**: the number of trees used in the adaboost algorithm;
+- **interaction.depth**: the depth of each tree used in the adaboost algorithm;
+- **bag.fraction**: the fraction of observations used in each tree. When less than one it means that is being performed a stochastic gradient descent approach;
+
+```{r gbm_tuning, cache=TRUE, eval = FALSE}
+# Performing grid search in order to find the best combination of hyperparameters
+# create hyperparameter grid
+hyper_grid <- expand.grid(
+  shrinkage = c(0.01, 0.1),
+  n.trees = c(seq(1,10,1), 50, 100, 500, 1000, 2000, 3000, 4000, 5000),
+  interaction.depth = c(1, 5, 9),
+  n.minobsinnode = 10,
+  bag.fraction = c(0.6, 0.8, 1),
+  auc = 0                    # a place to hold calculated aucs
+)
+
+
+# Splitting the training set into training and validation set
+# The reason we do that instead of performing cross-validation is to speed-up the hyperparameter tuning
+val_splits <- initial_split(dt_tr, prop = 0.75, strata=default)
+# Training data
+val_dtr <- training(val_splits)
+# Test data
+val_dtt <- testing(val_splits)
+
+# grid search 
+for(i in 1:nrow(hyper_grid)) {
+  
+  # train model
+  fit <- gbm(
+    formula = default ~ .,
+    distribution = "adaboost",
+    data = val_dtr,
+    n.trees = hyper_grid$n.trees[i],
+    interaction.depth = hyper_grid$interaction.depth[i],
+    shrinkage = hyper_grid$shrinkage[i],
+    n.minobsinnode = hyper_grid$n.minobsinnode[i],
+    bag.fraction = hyper_grid$bag.fraction[i],
+    n.cores = NULL, # will use all cores by default
+    verbose = FALSE
+  )
+  
+  # Add min training error and trees to grid
+  yhat_tt_val_gbm <- predict(fit, newdata = val_dtt, n.trees = hyper_grid$n.trees[i], type = "response")
+  
+  # Updating hyper_grid
+  hyper_grid$auc[i] <- roc(val_dtt$default, yhat_tt_val_gbm)$auc
+}
+```
+
+
+```{r}
+# Plotting F1-Score as a function of the number of trees and learning rate GBM
+hyper_grid %>% 
+  group_by(n.trees, shrinkage) %>%
+  summarise(auc_mean = mean(auc)) %>% 
+  ggplot(aes(x=n.trees, y=auc_mean, group = shrinkage, color = factor(shrinkage))) +
+  geom_line() +
+  ggtitle("Auc as a function of the number of trees and learning rate | GBM") +
+  ylab("Area Under the ROC Curve - AUC") +
+  xlab("Number of Trees")
+```
+
+
+```{r}
+# Plotting F1-Score as a function of the number of trees and interaction depth GBM
+hyper_grid %>% 
+  group_by(n.trees, interaction.depth) %>%
+  summarise(auc_mean = mean(auc)) %>% 
+  ggplot(aes(x=n.trees, y=auc_mean, group = interaction.depth, color = factor(interaction.depth))) +
+  geom_line() +
+  ggtitle("AUC as a function of the number of trees and interaction depth | GBM") +
+  ylab("Area Under the ROC Curve - AUC") +
+  xlab("Number of Trees")
+```
+
+
+```{r}
+# Plotting F1-Score as a function of the number of trees and bag fraction GBM
+hyper_grid %>% 
+  group_by(n.trees, bag.fraction) %>%
+  summarise(auc_mean = mean(auc)) %>% 
+  ggplot(aes(x=n.trees, y=auc_mean, group = bag.fraction, color = factor(bag.fraction))) +
+  geom_line() +
+  ggtitle("AUC as a function of the number of trees and bag fraction | GBM") +
+  ylab("Area Under the ROC Curve - AUC") +
+  xlab("Number of Trees")
+```
+
+Looking at the above plots, it is possible to notice some interesting things:
+
+- Differently from the random forest model, the performance of the model grows up to a certain number of trees and the starts to decrease. That suggests that for gradient boosting models as the number of trees grows after a limit, the model starts to overfit the data, losing performance. In the image it only shows this behaviour for the a shrinkage value of 0.1, however, if the maximum number of trees was increased to 5000, the same behaviour would be shown. That, in fact, points out to another observation: using 0.01 as learning rate result a model there is much slower to arrive to the prediction, that is, it takes much more trees to learn how to predict from the data;
+- There is no much difference about using **interaction.depth** as 9 or 5, however, there seems to be a reduction in performance when setting this parameter to 1;
+- The best **bag.fraction** value seems to be 0.6. That means that probably, the problem being studied may have several local minimums. Therefore, in order to reach the global minimum, it is preferable to not use all the observation for each tree as it could always lead to the same local minimum. That also means that the model could reach a similar but different result each time it is run. 
+
+```{r}
+hyper_grid %>% 
+  dplyr::arrange(desc(auc)) %>%
+  head(10)
+```
+
+For the range set for each hyperparameter the best model seems to be the one with the configuration detailed bellow. However, further search refining the some hyperparameters range could show a even better configuration. That process will be left for future work.
+
+```{r best_model_gbm, cache=TRUE}
+# Best dbm model
+best_gbm <- gbm(
+    formula = default ~ .,
+    distribution = "adaboost",
+    data = dt_tr,
+    n.trees = 3000,
+    interaction.depth = 9,
+    shrinkage = 0.01,
+    n.minobsinnode = 10,
+    bag.fraction = 0.6,
+    n.cores = NULL, # will use all cores by default
+    verbose = FALSE
+  )
+
+# Prediction of satisfied clients for the training set
+yhat_gbm_tr <- predict(best_gbm, newdata = dt_tr, type="response")
+
+# Prediction of satisfied clients for the test set
+yhat_gbm_tt <- predict(best_gbm, newdata = dt_tt, type="response")
+
+# Table of metrics for plotting
+table_gbm <- tibble(threshold = c(seq(0, 1, 0.01)),
+                    true_positive_rate = NA,
+                    false_positive_rate = NA,
+                    accuracy = NA,
+                    precision = NA,
+                    recall = NA,
+                    f1_score = NA)
+
+# Calculate metrics for varying thresholds
+for ( t in c(seq(0.0, 1, 0.01)) ){
+  
+  tb <- metrics_table(t, dt_tt$default, yhat_gbm_tt)
+  
+  table_gbm$true_positive_rate[table_gbm$threshold == t]   <- tb$values[tb$metric == "True Positive Rate (TPR)"]
+  table_gbm$false_positive_rate[table_gbm$threshold == t]  <- tb$values[tb$metric == "False Positive Rate (FPR)"]
+  table_gbm$accuracy[table_gbm$threshold == t]             <- tb$values[tb$metric == "Accuracy"]
+  table_gbm$precision[table_gbm$threshold == t]            <- tb$values[tb$metric == "Precision"]
+  table_gbm$recall[table_gbm$threshold == t]               <- tb$values[tb$metric == "Recall"]
+  table_gbm$f1_score[table_gbm$threshold == t]             <- tb$values[tb$metric == "F1 Score"]
+  
+}
+
+table_gbm <- table_gbm[complete.cases(table_gbm), ]
+
+# Calculating Optimal Threshold
+opt_threshold_gbm <- table_gbm$threshold[table_gbm$f1_score == max(table_gbm$f1_score, na.rm = TRUE)]
+opt_tpr_gbm       <- table_gbm$true_positive_rate[table_gbm$f1_score == max(table_gbm$f1_score, na.rm = TRUE)]
+
+# Table filtering considering the optimal threshold as the value that maximizes the metric F1-Score
+table_gbm %>% filter(table_gbm$threshold == opt_threshold_gbm)
+```
+
+
+Lookin at the accuracy and F1-score curves for GBM-Adaboost model now it is possible to see some differences: **The best threshold value is lower, 0.13, than the values for the previous models**, and the metric seems to decrease more rapidly after reaching its maximum. The ROC curve, however, looks very similar.
+
+
+```{r}
+# Creating selections
+table_gbm %>% 
+  select(threshold, accuracy) %>% 
+  dplyr::rename(value = accuracy) %>% 
+  mutate(metric = "Accuracy") %>% 
+# Binding rows
+bind_rows(
+    table_gbm %>% 
+    select(threshold, f1_score) %>% 
+      dplyr::rename(value = f1_score) %>% 
+      mutate(metric = "F1 Score")) %>% 
+        # Plotting
+        ggplot(aes(x=threshold, y=value, group = metric, color = metric)) + 
+        geom_line() +
+        ggtitle("Accuracy and F1-Score for varying thresholds  | GBM Adaboost") +
+        xlab("Threshold") +
+        ylab("Metric Value")
+```
+
+
+```{r}
+# Plotting ROC Curve
+table_gbm %>%
+  ggplot(aes(x=false_positive_rate, y=true_positive_rate, color = true_positive_rate == opt_threshold_gbm)) + 
+  geom_point() +
+  scale_color_manual(values = c("FALSE" = "darkgray", "TRUE" = "red")) +
+  geom_abline(intercept = 0, slope = 1, color="blue", linetype="dashed", size=1.0) +
+  ggtitle("Receiver Operating Characteristic (ROC) Curve | GBM Adaboost") +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  xlab("False Positive Rate (1 - Specificity)") +
+  ylab("True Positive Rate (Sensitivity)") + 
+  theme_light()
+```
+
+
+Looking at the result table, the summary performance of the GBM - Adaboost model it is possible to see that the **F1 Score** value is the best obtained so far, **0.373**, with slightly decrease in the **AUC** value, **0.880**. Furthermore, it is interesting to notice that is dows a better working balancing between precision and recall when compared to the random forest model.
+
+
+```{r}
+# Updating results table
+results$accuracy[results$model == "GBM"]  <- table_gbm$accuracy[table_gbm$f1_score == max(table_gbm$f1_score)]
+results$precision[results$model == "GBM"] <- table_gbm$precision[table_gbm$f1_score == max(table_gbm$f1_score)]
+results$recall[results$model == "GBM"]    <- table_gbm$recall[table_gbm$f1_score == max(table_gbm$f1_score)]
+results$f1_score[results$model == "GBM"]  <- table_gbm$f1_score[table_gbm$f1_score == max(table_gbm$f1_score)]
+results$auc[results$model == "GBM"]       <- roc(dt_tt$default, yhat_gbm_tt)$auc
+results
+```
+
+
+```{r}
+# Plotting Confusion Matrix
+cmt_gbm <- metrics_table(opt_threshold_gbm, dt_tt$default, yhat_gbm_tt)
+confusion_matrix <- tibble(x = c("Actual Positive", "Actual Negative"),
+                           y = c(cmt_gbm$values[cmt_gbm$metric == "True Positive (TP)"], 
+                                 cmt_gbm$values[cmt_gbm$metric == "False Positive (FP)"]),
+                           z = c(cmt_gbm$values[cmt_gbm$metric == "False Negative (FN)"],
+                                 cmt_gbm$values[cmt_gbm$metric == "True Negative (TN)"]))
+knitr::kable(confusion_matrix,
+             caption = "Confusion Matrix | Gradient Boost - Adaboost",
+             col.names = c("Measure", "Predicted Positive", "Predicted Negative"))
+```
+
+
+### XGBoost - Binary Logistic
+
+Finally, this section will study the last model in this analysis: a xgboost model using Binary Logistic cost function. The study, therefore, will use the **xgboost** library and, since the analysis deals with a classification problem, the algorithm will try to minimize the binary logistic cost function. For that reason, the **objective** parameter of the function will be set to **"binary:logistic"**. For the purpose of tuning the XGBoost - Binary Logistic model, it will be created a grid search varying the following parameters:
+
+- **eta**: the learning rate of the gradient descent algorithm;
+- **nrounds**: the number of trees used in the algorithm;
+- **max_depth**: the depth of each tree used in the algorithm;
+- **subsample**: the fraction of observations used in each tree. When less than one it means that is being performed a stochastic gradient descent approach;
+- **min_child_weight**: the number of observations in terminal nodes of each tree;
+- **colsample_bytree**: the number of features used by each tree in the algorithm;
+
+```{r}
+# Converting to matrix
+x <- model.matrix(default ~. -1, bisnode)
+
+# Converting to dataframe
+bisnode_xgb <- data.frame(x) %>% mutate(default = bisnode$default)
+
+# Reproducibility
+set.seed(0)
+
+# Splitting the dataset into training and testing
+splits_xgb <- initial_split(bisnode_xgb, prop = 0.8, strata=default)
+
+# Training and test data
+dtr_xgb <- training(splits)
+dtt_xgb <- testing(splits)
+
+# Converting the training and test set to matrix
+dtr_xgb_dm <- xgb.DMatrix(label = dtr_xgb$default, data = as.matrix(select(dtr_xgb, -default)))
+dtt_xgb_dm <- xgb.DMatrix(label = dtt_xgb$default, data = as.matrix(select(dtt_xgb, -default)))
+```
+
+
+```{r xgboost_tuning, cache=TRUE, eval=FALSE}
+# Performing grid search in order to find the best combination of hyperparameters
+# create hyperparameter grid
+hyper_grid_xgb2 <- expand.grid(
+  eta = c(0.01, 0.1),
+  max_depth = c(1, 5, 9),
+  min_child_weight = c(1, 5, 9),
+  subsample = c(.65, .8, 1),
+  colsample_bytree = c(0.65, .8, 1),
+  opt_trees_log = 0,                 
+  opt_trees_error = 0,                
+  opt_trees_auc = 0,
+  train_logloss_mean = 0,
+  test_logloss_mean = 0,
+  train_error_mean = 0,
+  test_error_mean = 0,
+  train_auc_mean = 0,
+  test_auc_mean = 0)
+
+# total number of combinations
+nrow(hyper_grid_xgb2)
+
+# grid search 
+for(i in 1:nrow(hyper_grid_xgb2)) {
+  
+  # create parameter list
+  params <- list(
+    eta = hyper_grid_xgb2$eta[i],
+    max_depth = hyper_grid_xgb2$max_depth[i],
+    min_child_weight = hyper_grid_xgb2$min_child_weight[i],
+    subsample = hyper_grid_xgb2$subsample[i],
+    colsample_bytree = hyper_grid_xgb2$colsample_bytree[i]
+  )
+  
+  # train model
+  xgb.tune <- xgb.cv(
+    params = params,
+    data = dtr_xgb_dm,
+    nrounds = 1000,
+    nfold = 5,
+    objective = "binary:logistic",  # for regression models
+    verbose = 0,        
+    metrics = list("error","logloss","auc"),
+    early_stopping_rounds = 10 # stop if no improvement for 10 consecutive trees
+  )
+  
+  # add min training error and trees to grid
+  hyper_grid_xgb2$opt_trees_log[i]      <- which.min(xgb.tune$evaluation_log$test_logloss_mean)
+  hyper_grid_xgb2$opt_trees_error[i]    <- which.min(xgb.tune$evaluation_log$test_error_mean)
+  hyper_grid_xgb2$opt_trees_auc[i]      <- which.min(xgb.tune$evaluation_log$test_auc_mean)
+  hyper_grid_xgb2$train_logloss_mean[i] <- min(xgb.tune$evaluation_log$train_logloss_mean)
+  hyper_grid_xgb2$test_logloss_mean[i]  <- min(xgb.tune$evaluation_log$test_logloss_mean)
+  hyper_grid_xgb2$train_error_mean[i]   <- min(xgb.tune$evaluation_log$train_error_mean)
+  hyper_grid_xgb2$test_error_mean[i]    <- min(xgb.tune$evaluation_log$test_error_mean)
+  hyper_grid_xgb2$train_auc_mean[i]     <- min(xgb.tune$evaluation_log$train_auc_mean)
+  hyper_grid_xgb2$test_auc_mean[i]      <- min(xgb.tune$evaluation_log$test_auc_mean)
+}
+```
+
+As for the GBM - Adaboost model, refining the grid search and the interpretation of the impact of the each hyperparameter in loss reduction will be studied in future work. Furthermore, most of the interpretation made for the GBM - Adaboost model is valid for the XGBoost - Binary Logistic model. For the purpose of this work, the best model will be selected looking at the models that resulted the highest AUCs for during the first grid search. The configuration is shown in the code bellow.
+
+```{r best_model_xbg, cache=TRUE}
+# parameter list
+params <- list(
+  eta = 0.01,
+  max_depth = 9,
+  min_child_weight = 9,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+# train final model
+xgb_best <- xgboost(
+  params = params,
+  data = dtr_xgb_dm,
+  nrounds = 3000,
+  objective = "binary:logistic",
+  verbose = 0
+)
+
+# vetor of predicitions
+yhat_tt_xgb <- predict(xgb_best, newdata = dtt_xgb_dm, n.trees = 3000, type = "response")
+
+# Table of metrics for plotting
+table_xgb <- tibble(threshold = c(seq(0, 1, 0.01)),
+                   true_positive_rate = NA,
+                   false_positive_rate = NA,
+                   accuracy = NA,
+                   precision = NA,
+                   recall = NA,
+                   f1_score = NA)
+
+# Calculate metrics for varying thresholds
+for ( t in c(seq(0, 1, 0.01)) ){
+  
+  tb <- metrics_table(t, dt_tt$default, yhat_tt_xgb)
+  
+  table_xgb$true_positive_rate[table_xgb$threshold == t]   <- tb$values[tb$metric == "True Positive Rate (TPR)"]
+  table_xgb$false_positive_rate[table_xgb$threshold == t]  <- tb$values[tb$metric == "False Positive Rate (FPR)"]
+  table_xgb$accuracy[table_xgb$threshold == t]             <- tb$values[tb$metric == "Accuracy"]
+  table_xgb$precision[table_xgb$threshold == t]            <- tb$values[tb$metric == "Precision"]
+  table_xgb$recall[table_xgb$threshold == t]               <- tb$values[tb$metric == "Recall"]
+  table_xgb$f1_score[table_xgb$threshold == t]             <- tb$values[tb$metric == "F1 Score"]
+  
+}
+
+table_xgb <- table_xgb[complete.cases(table_xgb), ]
+
+# Calculating Optimal Threshold
+opt_threshold_xgb <- table_xgb$threshold[table_xgb$f1_score == max(table_xgb$f1_score, na.rm = TRUE)]
+opt_tpr_xgb <- table_xgb$true_positive_rate[table_xgb$f1_score == max(table_xgb$f1_score, na.rm = TRUE)]
+
+# Best Result
+table_xgb %>% filter(table_xgb$threshold == opt_threshold_xgb)
+```
+
+The accuracy and F1-score curves and the ROC curve for the XGBoost - Binary Logistic model look very similar to the curves obtained for the GBM - Adaboost model. The only difference is that **the best threshold for the XGBoost - Binary Logistic model is even lower, 0.10**.
+
+
+```{r}
+# Creating selections
+table_xgb %>% 
+  select(threshold, accuracy) %>% 
+  dplyr::rename(value = accuracy) %>% 
+  mutate(metric = "Accuracy") %>% 
+# Binding rows
+bind_rows(
+    table_xgb %>% 
+    select(threshold, f1_score) %>% 
+      dplyr::rename(value = f1_score) %>% 
+      mutate(metric = "F1 Score")) %>% 
+        # Plotting
+        ggplot(aes(x=threshold, y=value, group = metric, color = metric)) + 
+        geom_line() +
+        ggtitle("Accuracy and F1-Score for varying thresholds | XGBoost Binary Logistic") +
+        xlab("Threshold") +
+        ylab("Metric Value")
+```
+
+
+```{r}
+# Plotting ROC Curve
+table_xgb %>%
+  ggplot(aes(x=false_positive_rate, y=true_positive_rate, color = true_positive_rate == opt_tpr_xgb)) + 
+  geom_point() +
+  scale_color_manual(values = c("FALSE" = "grey", "TRUE" = "red")) +
+  geom_abline(intercept = 0, slope = 1, color="blue", linetype="dashed", size=1.0) +
+  ggtitle("Receiver Operating Characteristic (ROC) Curve | XGBoost Binary Logistic") +
+  xlab("False Positive Rate") +
+  ylab("True Positive Rate") + 
+  theme_light()
+```
+
+Looking at the final results, it is possible to note that from the f1-score standing point, which is the metric that is this study is trying to maximize so far, the best model would be the GBM - Adaboost, even tough it is not the model with the highest auc. If the purpose of the objective was in fact to choose the model if the highest auc, the random forest model would be selected. As for the XGBoost - Binary Logistic, the auc and f1-score metrics, **0.87** and *0.337*, respectively, are lower than the ones obtained for the GBM - Adaboost model.
+
+
+```{r}
+# Updating results table
+results$accuracy[results$model == "XGB"]  <- table_xgb$accuracy[table_xgb$threshold == opt_threshold_xgb]
+results$precision[results$model == "XGB"] <- table_xgb$precision[table_xgb$threshold == opt_threshold_xgb]
+results$recall[results$model == "XGB"]    <- table_xgb$recall[table_xgb$threshold == opt_threshold_xgb]
+results$f1_score[results$model == "XGB"]  <- table_xgb$f1_score[table_xgb$threshold == opt_threshold_xgb]
+results$auc[results$model == "XGB"]       <- roc(dt_tt$default, yhat_tt_xgb)$auc
+results
+```
+
+
+```{r}
+# Plotting Confusion Matrix
+cmt_xgb <- metrics_table(opt_threshold_xgb, dt_tt$default, yhat_tt_xgb)
+confusion_matrix_xgb <- tibble(x = c("Actual Positive", "Actual Negative"),
+                           y = c(cmt_xgb$values[cmt_xgb$metric == "True Positive (TP)"], 
+                                 cmt_xgb$values[cmt_xgb$metric == "False Positive (FP)"]),
+                           z = c(cmt_xgb$values[cmt_xgb$metric == "False Negative (FN)"],
+                                 cmt_xgb$values[cmt_xgb$metric == "True Negative (TN)"]))
+knitr::kable(confusion_matrix_xgb,
+             caption = "Confusion Matrix | XGBoost - Binary Logistic",
+             col.names = c("Measure", "Predicted Positive", "Predicted Negative"))
+```
+
+
+### Variable Importance Plots
+
+Looking at the 10 most important variables, it is possible to highlight two important ascpect:
+
+- The most important metric is a financial metric calculated during feature engineering and indicate the growth in sales from 2011 to 2012 (being last year the year used as reference for prediction). The image also shows other created features during feature engineering among the 10 most important features.
+
+- The top 15 features are features related to the year of reference 2012, even though the dataset had the same features for the previous two year (2011 and 2010).
+
+These observations suggests two conclusions:
+
+- First, looking at similar study published in (BÉKÉS, G. et al, 2021), the best model obtained by the author was a logistic regression model and had an auc of 0.78. The logistic regression model obtained in this present work arrived at an auc of 0.86. Furthermore, all models studied throught this work also showed an similar result for the auc. The main difference between the model created in this work and the model created by BÉKÉS is the dataset used. Therefore, the main reason for the increase in performance can only be due to the features created to explain the model. In other words, some features created during the feature engineering process explain better why a company defaults than the original features in the dataset. This conclusion, in fact, points out to the importance of understanding the business before applying modeling techniques, since using the right feature (especially when it is a metric that has to be created during feature engineering) could be a game changing.
+
+- Secondly, since all features at the top 15 most important features are related to 2012, it suggests that the more recent an information is from the reference year of prediction more information it has about the explained variable. Looking from a business perspective that also makes a lot of sense since a lot of companies defaults because of only one year of bad management or bad sales performance. 
+
+```{r}
+# Plotting Variable Importance
+vi_gbm <- vi(best_gbm)
+
+# Plotting the variable importance for the random forest
+gvi_gbm <- vi_gbm %>%
+  head(30) %>% 
+  ggplot(aes(x=reorder(Variable, Importance), y = Importance)) + 
+  geom_bar(stat = "identity") +
+  ggtitle("GBM Adaboost - Variable Importance") +
+  ylab("Importance Value") +
+  xlab("Variable") +
+  coord_flip()
+gvi_gbm
+```
+
+
+### Partial Dependence Plots
+
+Without getting into much details in the analysis of the partial dependence plots and ICE plots, it can be seems that the selected variables are are behaving as expected, for example, for the **sig_growth_sales_2012_2011**, which is the most important variable, the higher the value the lower is the probability of default. That suggests that most companies that defaults have a bad year of sales, compared to the previous year, before actually defaulting. The other thing that interesting to highlight is strange beahviours seems in the plots could, in fact, be due to the lack of data. Taking the ICE curve of the **sig_profit_margin_2012** as an example, it seems odd that the probability of default increases for high values of this feature, meaning that companies that are more profitable have a higher probability of defaulting. Looking at the rug plot at the bottom of this same graph we see that, in fact, the is a low density of data in the region mentioned, indicating that this behaviour could actually be a distortion caused by few observation, for example, companies that had few sales (small denominator), even though it was profitable for the amount of sales (resulting a high ration between profit and sales), and that were faded to default.
+
+```{r}
+# Creating an explanatory object
+explainer_object <- explain(model = best_gbm, # model
+                            data = dt_tt, # test data - probability
+                            y = dt_tt$default # test data - target variable
+                            )
+
+# Create a plot Object of Partial Dependence Plots (PDP)
+pdp_gbm_01 <- model_profile(explainer = explainer_object, variables = c("sig_growth_sales_2012_2011",
+                                                                       "log_inventories",  
+                                                                       "log_liq_assets")) %>%  plot() 
+
+pdp_gbm_02 <- model_profile(explainer = explainer_object, variables = c("sig_profit_margin_2012",
+                                                                       "log_sales",
+                                                                       "log_curr_assets")) %>%  plot()
+grid.arrange(pdp_gbm_01, pdp_gbm_02, ncol = 1, nrow = 2)
+```
+
+```{r}
+pdp1 <- best_gbm %>%
+  partial(pred.var = "sig_growth_sales_2012_2011", n.trees = 3000, rid.resolution = 100, train = dt_tr) %>%
+  autoplot(rug = TRUE, train = dt_tr)
+  ggtitle("PDP")
+
+ice1 <- best_gbm %>%
+  partial(pred.var = "sig_growth_sales_2012_2011", n.trees = 3000, grid.resolution = 100, train = dt_tr, ice = TRUE) %>%
+  autoplot(rug = TRUE, train = dt_tr, alpha = .01, center = TRUE)
+  ggtitle("ICE")
+
+gridExtra::grid.arrange(pdp1, ice1, nrow = 1)
+```
+
+```{r}
+pdp2 <- best_gbm %>%
+  partial(pred.var = "log_inventories", n.trees = 3000, rid.resolution = 100, train = dt_tr) %>%
+  autoplot(rug = TRUE, train = dt_tr)
+  ggtitle("PDP")
+
+ice2 <- best_gbm %>%
+  partial(pred.var = "log_inventories", n.trees = 3000, grid.resolution = 100, train = dt_tr, ice = TRUE) %>%
+  autoplot(rug = TRUE, train = dt_tr, alpha = .01, center = TRUE)
+  ggtitle("ICE")
+
+gridExtra::grid.arrange(pdp2, ice2, nrow = 1)
+```
+
+```{r}
+pdp3 <- best_gbm %>%
+  partial(pred.var = "log_liq_assets", n.trees = 3000, rid.resolution = 100, train = dt_tr) %>%
+  autoplot(rug = TRUE, train = dt_tr)
+  ggtitle("PDP")
+
+ice3 <- best_gbm %>%
+  partial(pred.var = "log_liq_assets", n.trees = 3000, grid.resolution = 100, train = dt_tr, ice = TRUE) %>%
+  autoplot(rug = TRUE, train = dt_tr, alpha = .01, center = TRUE)
+  ggtitle("ICE")
+
+gridExtra::grid.arrange(pdp3, ice3, nrow = 1)
+```
+
+```{r}
+pdp4 <- best_gbm %>%
+  partial(pred.var = "sig_profit_margin_2012", n.trees = 3000, rid.resolution = 100, train = dt_tr) %>%
+  autoplot(rug = TRUE, train = dt_tr)
+  ggtitle("PDP")
+
+ice4 <- best_gbm %>%
+  partial(pred.var = "sig_profit_margin_2012", n.trees = 3000, grid.resolution = 100, train = dt_tr, ice = TRUE) %>%
+  autoplot(rug = TRUE, train = dt_tr, alpha = .01, center = TRUE)
+  ggtitle("ICE")
+
+gridExtra::grid.arrange(pdp4, ice4, nrow = 1)
+```
+
+
+### Best model from a business perspective
+
+This section will be left for future work.
+
+```{r}
+for (t in seq(0, 1, 0.01)){
+  
+  tb_lg <- metrics_table(t, dt_tt$default,yhat_lg_tt)
+  tb_lasso <- metrics_table(t, dt_tt$default, yhat_lg_lasso_tt)
+  tb_rf <- metrics_table(t, dt_tt$default, yhat_tt_rf$predictions)
+  tb_gbm <- metrics_table(t, dt_tt$default, yhat_gbm_tt)
+  tb_xgb <- metrics_table(t, dt_tt$default, yhat_tt_xgb)
+}
+result_business <- tibble(
+max_cm_lg    = tb_lg$values[tb_lg$metric == "Custom Metric"],
+max_cm_lasso = tb_lasso$values[tb_lasso$metric == "Custom Metric"],
+max_cm_rf    = tb_rf$values[tb_rf$metric == "Custom Metric"],
+max_cm_gbm   = tb_gbm$values[tb_gbm$metric == "Custom Metric"],
+max_cm_xgb   = tb_xgb$values[tb_xgb$metric == "Custom Metric"]
+)
+```
+
+
+### Reference
+
+BÉKÉS, G., KÉZDI, G. **Data analysis for business, economics, and policy**. United Kingdom: Cambridge University Press, 2021. p. 472.
+
+BOEHMKE, B. **Gradient Boosting Machines**. UC Business Analytics R Programming Guide. 14 jun. 2018. Available in: http://uc-r.github.io/gbm_regression. Acessed on 22 mar. 2022.
+
+**Bisnode Firms**. OSF Reasearch. 14 jun. 2018. Available in: https://osf.io/9a3t4/?pid=b2ft9. Acessed on 22 mar. 2022.
